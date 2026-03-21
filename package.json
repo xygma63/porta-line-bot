@@ -1,0 +1,12 @@
+{
+  "name": "porta-line-bot",
+  "version": "1.0.0",
+  "description": "Porta LINE Bot - 台灣政府補助 AI 顧問",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
