@@ -3,41 +3,49 @@ import crypto from 'crypto';
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
+const AIRTABLE_BASE = process.env.AIRTABLE_BASE;
+const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE;
 
 const conversationHistory = {};
 
-const SYSTEM_PROMPT = `你是 Porta 的 AI 補助顧問「玥」，專門幫助台灣用戶找到最適合的政府補助資源。
+async function fetchSubsidies() {
+  const records = [];
+  let offset = null;
 
-你擁有完整的台灣政府補助資料庫，涵蓋以下類別：
-- 補助：租金補貼、生育給付、育兒津貼、節能補助、SBIR研發補助、SIIR服務業補助、TIIP產業升級等
-- 貸款/融資：青年創業貸款、微型創業鳳凰貸款、中小企業信保基金、農業貸款等
-- 法律/諮詢：法律扶助基金會、勞資爭議調解、消費者保護、智慧財產諮詢等
-- 課程/職訓：在職進修補助（3年10萬）、失業職訓、數位轉型培訓等
-- 稅務：所得稅退稅、研發投資抵減、房屋稅自住優惠、地價稅優惠等
-- 其他資源：就學貸款、弱勢助學、社區發展補助等
+  do {
+    let url = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_TABLE}?pageSize=100&filterByFormula={審核狀態}="已上線"`;
+    if (offset) url += `&offset=${offset}`;
 
-【對話原則】
-1. 先了解用戶的身份和需求（個人/小店家/社區/租屋者），再推薦最適合的補助
-2. 每次推薦 2-3 個最相關的補助，不要一次列太多
-3. 說明具體的申請步驟和聯絡方式
-4. 語氣親切、專業，使用繁體中文
-5. 如果用戶問的補助不在你的資料庫，誠實說明並建議查詢政府官網
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
+    });
+    const data = await res.json();
+    records.push(...(data.records || []));
+    offset = data.offset || null;
+  } while (offset);
 
-【回覆格式】
-- LINE 不支援 Markdown，不要用 ** 粗體 ** 或 # 標題
-- 用數字列表（1. 2. 3.）或換行分隔
-- 每則回覆控制在 300 字以內，保持簡潔
-- 重要資訊用📌或✅標記，讓視覺更清晰`;
-
-function verifySignature(body, signature) {
-  const hash = crypto
-    .createHmac('SHA256', LINE_CHANNEL_SECRET)
-    .update(body)
-    .digest('base64');
-  return hash === signature;
+  return records.map(r => r.fields);
 }
 
-async function callClaude(userId, userMessage) {
+function buildSubsidyContext(subsidies) {
+  return subsidies.map(s => {
+    return [
+      `【${s['專案標題'] || ''}】`,
+      s['補助形式'] ? `形式：${s['補助形式']}` : '',
+      s['適合對象'] ? `適合：${s['適合對象']}` : '',
+      s['補助金額'] ? `金額：${s['補助金額']}` : '',
+      s['專案期間'] ? `期間：${s['專案期間']}` : '',
+      s['專案來源'] ? `來源：${s['專案來源']}` : '',
+      s['專案簡介'] ? `簡介：${s['專案簡介'].slice(0, 150)}` : '',
+      s['專案攻略'] ? `申請：${s['專案攻略'].slice(0, 150)}` : '',
+      s['聯絡資訊'] ? `聯絡：${s['聯絡資訊']}` : '',
+      s['專案連結'] ? `連結：${s['專案連結']}` : '',
+    ].filter(Boolean).join('\n');
+  }).join('\n\n---\n\n');
+}
+
+async function callClaude(userId, userMessage, subsidyContext) {
   if (!conversationHistory[userId]) {
     conversationHistory[userId] = [];
   }
@@ -51,6 +59,26 @@ async function callClaude(userId, userMessage) {
     conversationHistory[userId] = conversationHistory[userId].slice(-20);
   }
 
+  const systemPrompt = `你是 Porta 的 AI 補助顧問「玥」，專門幫助台灣用戶找到最適合的政府補助資源。
+
+以下是 Porta 目前收錄的真實補助資料庫，請根據這些資料回答用戶問題：
+
+${subsidyContext}
+
+【對話原則】
+1. 只根據上方資料庫的補助內容回答，不要憑空捏造補助內容
+2. 先了解用戶的身份和需求，再推薦最適合的補助
+3. 每次推薦 2-3 個最相關的補助，不要一次列太多
+4. 說明具體的申請步驟和聯絡方式
+5. 語氣親切、專業，使用繁體中文
+6. 如果資料庫沒有符合的補助，誠實說明並建議查詢政府官網
+
+【回覆格式】
+- LINE 不支援 Markdown，不要用 ** 粗體 ** 或 # 標題
+- 用數字列表（1. 2. 3.）或換行分隔
+- 每則回覆控制在 300 字以內，保持簡潔
+- 重要資訊用📌或✅標記`;
+
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -61,7 +89,7 @@ async function callClaude(userId, userMessage) {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       messages: conversationHistory[userId],
     }),
   });
@@ -89,6 +117,14 @@ async function replyToLine(replyToken, message) {
       messages: [{ type: 'text', text: message }],
     }),
   });
+}
+
+function verifySignature(body, signature) {
+  const hash = crypto
+    .createHmac('SHA256', LINE_CHANNEL_SECRET)
+    .update(body)
+    .digest('base64');
+  return hash === signature;
 }
 
 export default async function handler(req, res) {
@@ -119,7 +155,9 @@ export default async function handler(req, res) {
     const replyToken = event.replyToken;
 
     try {
-      const reply = await callClaude(userId, userMessage);
+      const subsidies = await fetchSubsidies();
+      const subsidyContext = buildSubsidyContext(subsidies);
+      const reply = await callClaude(userId, userMessage, subsidyContext);
       await replyToLine(replyToken, reply);
     } catch (error) {
       console.error('Error:', error);
