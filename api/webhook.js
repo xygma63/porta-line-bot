@@ -6,17 +6,16 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 const AIRTABLE_BASE = process.env.AIRTABLE_BASE;
 const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE;
+const AIRTABLE_LOG_TABLE = 'tblijVJyjUEdkWTEP';
 
 const conversationHistory = {};
 
 async function fetchSubsidies() {
   const records = [];
   let offset = null;
-
   do {
     let url = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_TABLE}?pageSize=100&filterByFormula={審核狀態}="已上線"`;
     if (offset) url += `&offset=${offset}`;
-
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
     });
@@ -24,7 +23,6 @@ async function fetchSubsidies() {
     records.push(...(data.records || []));
     offset = data.offset || null;
   } while (offset);
-
   return records.map(r => r.fields);
 }
 
@@ -45,15 +43,57 @@ function buildSubsidyContext(subsidies) {
   }).join('\n\n---\n\n');
 }
 
+async function logToAirtable(userId, userMessage, aiReply) {
+  try {
+    // 用 Claude 萃取關鍵字
+    const kwRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 50,
+        messages: [{
+          role: 'user',
+          content: `從以下訊息萃取1-3個補助相關關鍵字，只輸出關鍵字用逗號分隔，不要其他文字：「${userMessage}」`
+        }]
+      }),
+    });
+    const kwData = await kwRes.json();
+    const keywords = kwData.content?.[0]?.text || '';
+
+    await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_LOG_TABLE}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        records: [{
+          fields: {
+            時間: new Date().toISOString(),
+            用戶ID: userId,
+            用戶訊息: userMessage,
+            AI回覆: aiReply,
+            關鍵字: keywords,
+          }
+        }]
+      }),
+    });
+  } catch (e) {
+    console.error('Log error:', e);
+  }
+}
+
 async function callClaude(userId, userMessage, subsidyContext) {
   if (!conversationHistory[userId]) {
     conversationHistory[userId] = [];
   }
 
-  conversationHistory[userId].push({
-    role: 'user',
-    content: userMessage,
-  });
+  conversationHistory[userId].push({ role: 'user', content: userMessage });
 
   if (conversationHistory[userId].length > 20) {
     conversationHistory[userId] = conversationHistory[userId].slice(-20);
@@ -97,10 +137,7 @@ ${subsidyContext}
   const data = await response.json();
   const assistantMessage = data.content[0].text;
 
-  conversationHistory[userId].push({
-    role: 'assistant',
-    content: assistantMessage,
-  });
+  conversationHistory[userId].push({ role: 'assistant', content: assistantMessage });
 
   return assistantMessage;
 }
@@ -131,7 +168,6 @@ export default async function handler(req, res) {
   if (req.method === 'GET') {
     return res.status(200).send('Porta LINE Bot is running ✅');
   }
-
   if (req.method !== 'POST') {
     return res.status(405).send('Method Not Allowed');
   }
@@ -146,9 +182,7 @@ export default async function handler(req, res) {
   const events = req.body.events || [];
 
   for (const event of events) {
-    if (event.type !== 'message' || event.message.type !== 'text') {
-      continue;
-    }
+    if (event.type !== 'message' || event.message.type !== 'text') continue;
 
     const userId = event.source.userId;
     const userMessage = event.message.text;
@@ -158,13 +192,14 @@ export default async function handler(req, res) {
       const subsidies = await fetchSubsidies();
       const subsidyContext = buildSubsidyContext(subsidies);
       const reply = await callClaude(userId, userMessage, subsidyContext);
-      await replyToLine(replyToken, reply);
+      // 回覆用戶 + 背景記錄訊息（不影響回覆速度）
+      await Promise.all([
+        replyToLine(replyToken, reply),
+        logToAirtable(userId, userMessage, reply),
+      ]);
     } catch (error) {
       console.error('Error:', error);
-      await replyToLine(
-        replyToken,
-        '抱歉，系統暫時無法回應，請稍後再試。如需急用可直接撥打相關機關電話。'
-      );
+      await replyToLine(replyToken, '抱歉，系統暫時無法回應，請稍後再試。如需急用可直接撥打相關機關電話。');
     }
   }
 
