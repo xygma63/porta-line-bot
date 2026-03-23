@@ -43,9 +43,8 @@ function buildSubsidyContext(subsidies) {
   }).join('\n\n---\n\n');
 }
 
-async function logToAirtable(userId, userMessage, aiReply) {
+async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
   try {
-    // 用 Claude 萃取關鍵字
     const kwRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -79,6 +78,7 @@ async function logToAirtable(userId, userMessage, aiReply) {
             用戶訊息: userMessage,
             AI回覆: aiReply,
             關鍵字: keywords,
+            來源: source,
           }
         }]
       }),
@@ -192,10 +192,9 @@ export default async function handler(req, res) {
       const subsidies = await fetchSubsidies();
       const subsidyContext = buildSubsidyContext(subsidies);
       const reply = await callClaude(userId, userMessage, subsidyContext);
-      // 回覆用戶 + 背景記錄訊息（不影響回覆速度）
       await Promise.all([
         replyToLine(replyToken, reply),
-        logToAirtable(userId, userMessage, reply),
+        logToAirtable(userId, userMessage, reply, 'LINE'),
       ]);
     } catch (error) {
       console.error('Error:', error);
