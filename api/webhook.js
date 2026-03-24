@@ -6,7 +6,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 const AIRTABLE_BASE = process.env.AIRTABLE_BASE;
 const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE;
-const AIRTABLE_LOG_TABLE = 'tblijVJyjUEdkWTEP';
+const AIRTABLE_LOG_TABLE = 'tblVCrX3ZYpOs5Ixa';
 
 const conversationHistory = {};
 
@@ -43,8 +43,34 @@ function buildSubsidyContext(subsidies) {
   }).join('\n\n---\n\n');
 }
 
+// 從 LINE 取得用戶顯示名稱
+async function getLineUserName(userId) {
+  try {
+    const res = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
+      headers: { Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
+    });
+    const data = await res.json();
+    return data.displayName || '未知用戶';
+  } catch {
+    return '未知用戶';
+  }
+}
+
+// 查 Airtable 是否已有此用戶的記錄
+async function findUserRecord(userName) {
+  const encoded = encodeURIComponent(`{用戶名稱}="${userName}"`);
+  const res = await fetch(
+    `https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_LOG_TABLE}?filterByFormula=${encoded}&pageSize=1`,
+    { headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` } }
+  );
+  const data = await res.json();
+  const records = data.records || [];
+  return records.length > 0 ? records[0] : null;
+}
+
 async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
   try {
+    // 取得關鍵字
     const kwRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -64,25 +90,64 @@ async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
     const kwData = await kwRes.json();
     const keywords = kwData.content?.[0]?.text || '';
 
-    await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_LOG_TABLE}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        records: [{
+    // 取得用戶名稱
+    const userName = await getLineUserName(userId);
+
+    // 組對話紀錄這一筆
+    const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+    const newEntry = `[${now}]\n用戶：${userMessage}\n玥：${aiReply}\n`;
+
+    // 查有沒有舊記錄
+    const existing = await findUserRecord(userName);
+    const nowISO = new Date().toISOString();
+
+    if (existing) {
+      // 有舊記錄 → 追加對話
+      const oldLog = existing.fields['對話紀錄'] || '';
+      const oldKeywords = existing.fields['關鍵字'] || '';
+      const oldCount = existing.fields['對話次數'] || 0;
+      const allKeywords = oldKeywords
+        ? [...new Set([...oldKeywords.split(','), ...keywords.split(',')].map(k => k.trim()).filter(Boolean))].join(', ')
+        : keywords;
+
+      await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_LOG_TABLE}/${existing.id}`, {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
           fields: {
-            時間: new Date().toISOString(),
-            用戶ID: userId,
-            用戶訊息: userMessage,
-            AI回覆: aiReply,
-            關鍵字: keywords,
-            來源: source,
+            對話紀錄: oldLog + '\n' + newEntry,
+            關鍵字: allKeywords,
+            最後對話: nowISO,
+            對話次數: oldCount + 1,
           }
-        }]
-      }),
-    });
+        }),
+      });
+    } else {
+      // 沒有舊記錄 → 建新記錄
+      await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_LOG_TABLE}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          records: [{
+            fields: {
+              用戶名稱: userName,
+              來源: source,
+              對話紀錄: newEntry,
+              關鍵字: keywords,
+              首次對話: nowISO,
+              最後對話: nowISO,
+              對話次數: 1,
+            }
+          }]
+        }),
+      });
+    }
   } catch (e) {
     console.error('Log error:', e);
   }
@@ -92,9 +157,7 @@ async function callClaude(userId, userMessage, subsidyContext) {
   if (!conversationHistory[userId]) {
     conversationHistory[userId] = [];
   }
-
   conversationHistory[userId].push({ role: 'user', content: userMessage });
-
   if (conversationHistory[userId].length > 20) {
     conversationHistory[userId] = conversationHistory[userId].slice(-20);
   }
@@ -136,9 +199,7 @@ ${subsidyContext}
 
   const data = await response.json();
   const assistantMessage = data.content[0].text;
-
   conversationHistory[userId].push({ role: 'assistant', content: assistantMessage });
-
   return assistantMessage;
 }
 
@@ -174,13 +235,11 @@ export default async function handler(req, res) {
 
   const signature = req.headers['x-line-signature'];
   const rawBody = JSON.stringify(req.body);
-
   if (!verifySignature(rawBody, signature)) {
     return res.status(401).send('Unauthorized');
   }
 
   const events = req.body.events || [];
-
   for (const event of events) {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
 
