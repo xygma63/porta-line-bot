@@ -45,30 +45,46 @@ function buildSubsidyContext(subsidies) {
 function needsHumanIntervention(userMessage, messageCount) {
   const msg = userMessage.toLowerCase();
 
-  const emotionKeywords = ['生氣', '不滿', '抱怨', '爛', '沒用', '失望', '氣死', '白痴', '無言', '投訴'];
-  if (emotionKeywords.some(k => msg.includes(k))) {
-    return { needed: true, reason: '用戶情緒不佳' };
-  }
-  const actionKeywords = ['我想提案', '我要申請', '如何提案', '怎麼提案', '幫我申請', '我要合作', '聯絡你們'];
+  // 條件1：高意圖 - 想提案／合作／申請
+  const actionKeywords = [
+    '我想提案', '我要提案', '如何提案', '怎麼提案',
+    '我想合作', '我要合作', '想跟你們合作',
+    '我想申請', '我要申請', '幫我申請', '我要開始',
+  ];
   if (actionKeywords.some(k => msg.includes(k))) {
-    return { needed: true, reason: '用戶想申請／提案' };
+    return { needed: true, reason: '🎯 用戶想提案／合作／申請' };
   }
-  const personalKeywords = ['上傳文件', '填表', '需要什麼文件'];
-  if (personalKeywords.some(k => msg.includes(k))) {
-    return { needed: true, reason: '用戶需要文件協助' };
+
+  // 條件2：主動想接觸
+  const contactKeywords = [
+    '聯絡你們', '聯繫你們', '怎麼聯絡', '怎麼聯繫',
+    '有沒有電話', '可以打電話', '你們的email',
+    '可以約', '可以見面', '想見你們',
+  ];
+  if (contactKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: '📞 用戶想主動聯繫' };
   }
-  const confusedKeywords = ['你沒幫到', '這不是我要的', '答非所問', '你不懂'];
-  if (confusedKeywords.some(k => msg.includes(k))) {
-    return { needed: true, reason: 'AI 回答不符需求' };
+
+  // 條件3：情緒負面
+  const emotionKeywords = [
+    '生氣', '不滿', '抱怨', '爛', '沒用', '失望',
+    '氣死', '白痴', '無言', '怎麼搞的', '投訴',
+    '很差', '垃圾', '爛透了', '不好用',
+  ];
+  if (emotionKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: '😤 用戶情緒負面' };
   }
+
+  // 條件4：AI 連續回答 5 次還沒解決
   if (messageCount >= 5) {
-    return { needed: true, reason: `對話已達 ${messageCount} 次仍未解決` };
+    return { needed: true, reason: `🔄 對話已達 ${messageCount} 次仍未解決` };
   }
+
   return { needed: false };
 }
 
 async function notifyAdmins(userMessage, reason) {
-  const message = `🌐 網頁用戶需要協助！\n\n來源：網頁\n原因：${reason}\n訊息：${userMessage}\n\n👉 請至網站查看或主動聯繫用戶`;
+  const message = `🌐 網頁用戶需要協助！\n\n原因：${reason}\n訊息：${userMessage}\n\n👉 請至網站查看或主動聯繫用戶`;
 
   await Promise.all(ADMIN_IDS.map(adminId =>
     fetch('https://api.line.me/v2/bot/message/push', {
@@ -213,13 +229,11 @@ ${subsidyContext}
     const data = await response.json();
     const reply = data.content[0].text;
 
-    // 偵測是否需要通知
     const { needed, reason } = needsHumanIntervention(message, messageCount);
     if (needed) {
       await notifyAdmins(message, reason);
     }
 
-    // 記錄對話
     await logToAirtable(sessionId, message, reply);
 
     return res.status(200).json({ reply });
