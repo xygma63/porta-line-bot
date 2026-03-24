@@ -3,6 +3,11 @@ const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 const AIRTABLE_BASE = process.env.AIRTABLE_BASE;
 const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE;
 const AIRTABLE_LOG_TABLE = 'tblVCrX3ZYpOs5Ixa';
+const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
+
+const ADMIN_IDS = [
+  'Ub92d4bee9d4afd8e4afdd94a01f0497c', // 希小玥
+];
 
 async function fetchSubsidies() {
   const records = [];
@@ -35,6 +40,49 @@ function buildSubsidyContext(subsidies) {
       s['專案連結'] ? `連結：${s['專案連結']}` : '',
     ].filter(Boolean).join('\n');
   }).join('\n\n---\n\n');
+}
+
+function needsHumanIntervention(userMessage, messageCount) {
+  const msg = userMessage.toLowerCase();
+
+  const emotionKeywords = ['生氣', '不滿', '抱怨', '爛', '沒用', '失望', '氣死', '白痴', '無言', '投訴'];
+  if (emotionKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: '用戶情緒不佳' };
+  }
+  const actionKeywords = ['我想提案', '我要申請', '如何提案', '怎麼提案', '幫我申請', '我要合作', '聯絡你們'];
+  if (actionKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: '用戶想申請／提案' };
+  }
+  const personalKeywords = ['上傳文件', '填表', '需要什麼文件'];
+  if (personalKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: '用戶需要文件協助' };
+  }
+  const confusedKeywords = ['你沒幫到', '這不是我要的', '答非所問', '你不懂'];
+  if (confusedKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: 'AI 回答不符需求' };
+  }
+  if (messageCount >= 5) {
+    return { needed: true, reason: `對話已達 ${messageCount} 次仍未解決` };
+  }
+  return { needed: false };
+}
+
+async function notifyAdmins(userMessage, reason) {
+  const message = `🌐 網頁用戶需要協助！\n\n來源：網頁\n原因：${reason}\n訊息：${userMessage}\n\n👉 請至網站查看或主動聯繫用戶`;
+
+  await Promise.all(ADMIN_IDS.map(adminId =>
+    fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+      },
+      body: JSON.stringify({
+        to: adminId,
+        messages: [{ type: 'text', text: message }],
+      }),
+    })
+  ));
 }
 
 async function logToAirtable(sessionId, userMessage, aiReply) {
@@ -120,7 +168,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  const { message, history = [], sessionId } = req.body;
+  const { message, history = [], sessionId, messageCount = 0 } = req.body;
   if (!message) return res.status(400).json({ error: 'Missing message' });
 
   try {
@@ -140,6 +188,7 @@ ${subsidyContext}
 4. 說明具體的申請步驟和聯絡方式
 5. 語氣親切、專業，使用繁體中文
 6. 如果資料庫沒有符合的補助，誠實說明並建議查詢政府官網
+7. 如果用戶想提案或申請，回覆：「感謝您的興趣！我已通知專人為您服務，請稍候片刻 😊」
 
 【回覆格式】
 - 用數字列表或換行分隔
@@ -164,6 +213,13 @@ ${subsidyContext}
     const data = await response.json();
     const reply = data.content[0].text;
 
+    // 偵測是否需要通知
+    const { needed, reason } = needsHumanIntervention(message, messageCount);
+    if (needed) {
+      await notifyAdmins(message, reason);
+    }
+
+    // 記錄對話
     await logToAirtable(sessionId, message, reply);
 
     return res.status(200).json({ reply });
