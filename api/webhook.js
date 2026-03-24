@@ -8,11 +8,10 @@ const AIRTABLE_BASE = process.env.AIRTABLE_BASE;
 const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE;
 const AIRTABLE_LOG_TABLE = 'tblVCrX3ZYpOs5Ixa';
 
-// 你的 LINE ID，收到人工介入通知用
 const ADMIN_LINE_ID = 'Ub92d4bee9d4afd8e4afdd94a01f0497c';
 
 const conversationHistory = {};
-const userMessageCount = {}; // 記錄每個用戶的連續對話次數
+const userMessageCount = {};
 
 async function fetchSubsidies() {
   const records = [];
@@ -47,35 +46,29 @@ function buildSubsidyContext(subsidies) {
   }).join('\n\n---\n\n');
 }
 
-// 偵測是否需要人工介入
 function needsHumanIntervention(userMessage, aiReply, userId) {
   const msg = userMessage.toLowerCase();
 
-  // 條件1：用戶有情緒
   const emotionKeywords = ['生氣', '不滿', '抱怨', '爛', '沒用', '失望', '氣死', '白痴', '無言', '怎麼搞的', '投訴'];
   if (emotionKeywords.some(k => msg.includes(k))) {
     return { needed: true, reason: '用戶情緒不佳' };
   }
 
-  // 條件2：成交關鍵時刻
   const actionKeywords = ['我想提案', '我要申請', '如何提案', '怎麼提案', '幫我申請', '我要開始', '我要合作', '聯絡你們'];
   if (actionKeywords.some(k => msg.includes(k))) {
     return { needed: true, reason: '用戶想申請／提案' };
   }
 
-  // 條件3：涉及個人資料
   const personalKeywords = ['我的資料', '上傳文件', '填表', '需要什麼文件', '怎麼填'];
   if (personalKeywords.some(k => msg.includes(k))) {
     return { needed: true, reason: '用戶需要文件協助' };
   }
 
-  // 條件4：AI 回答不了
   const confusedKeywords = ['你沒有回答', '你沒幫到', '這不是我要的', '答非所問', '不對', '你不懂'];
   if (confusedKeywords.some(k => msg.includes(k))) {
     return { needed: true, reason: 'AI 回答不符需求' };
   }
 
-  // 條件5：對話超過 5 次還沒解決
   const count = userMessageCount[userId] || 0;
   if (count >= 5) {
     return { needed: true, reason: `對話已達 ${count} 次仍未解決` };
@@ -84,7 +77,6 @@ function needsHumanIntervention(userMessage, aiReply, userId) {
   return { needed: false };
 }
 
-// 推播通知給管理員
 async function notifyAdmin(userName, userMessage, reason, userId) {
   const message = `🚨 需要人工介入！\n\n用戶：${userName}\n原因：${reason}\n最後訊息：${userMessage}\n\n👉 請至 LINE OA 後台處理對話`;
 
@@ -113,8 +105,8 @@ async function getLineUserName(userId) {
   }
 }
 
-async function findUserRecord(userName) {
-  const encoded = encodeURIComponent(`{用戶名稱}="${userName}"`);
+async function findUserRecord(userId) {
+  const encoded = encodeURIComponent(`{LINE_ID}="${userId}"`);
   const res = await fetch(
     `https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_LOG_TABLE}?filterByFormula=${encoded}&pageSize=1`,
     { headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` } }
@@ -148,7 +140,7 @@ async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
     const userName = await getLineUserName(userId);
     const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
     const newEntry = `[${now}]\n用戶：${userMessage}\n玥：${aiReply}\n`;
-    const existing = await findUserRecord(userName);
+    const existing = await findUserRecord(userId);
     const nowISO = new Date().toISOString();
 
     if (existing) {
@@ -167,6 +159,7 @@ async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
         },
         body: JSON.stringify({
           fields: {
+            用戶名稱: userName,
             對話紀錄: oldLog + '\n' + newEntry,
             關鍵字: allKeywords,
             最後對話: nowISO,
@@ -185,6 +178,7 @@ async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
           records: [{
             fields: {
               用戶名稱: userName,
+              LINE_ID: userId,
               來源: source,
               對話紀錄: newEntry,
               關鍵字: keywords,
@@ -296,7 +290,6 @@ export default async function handler(req, res) {
     const userMessage = event.message.text;
     const replyToken = event.replyToken;
 
-    // 累計對話次數
     userMessageCount[userId] = (userMessageCount[userId] || 0) + 1;
 
     try {
@@ -304,12 +297,10 @@ export default async function handler(req, res) {
       const subsidyContext = buildSubsidyContext(subsidies);
       const reply = await callClaude(userId, userMessage, subsidyContext);
 
-      // 偵測是否需要人工介入
       const { needed, reason } = needsHumanIntervention(userMessage, reply, userId);
       if (needed) {
         const userName = await getLineUserName(userId);
         await notifyAdmin(userName, userMessage, reason, userId);
-        // 介入後重置計數
         userMessageCount[userId] = 0;
       }
 
