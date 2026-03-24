@@ -8,7 +8,11 @@ const AIRTABLE_BASE = process.env.AIRTABLE_BASE;
 const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE;
 const AIRTABLE_LOG_TABLE = 'tblVCrX3ZYpOs5Ixa';
 
+// 你的 LINE ID，收到人工介入通知用
+const ADMIN_LINE_ID = 'Ub92d4bee9d4afd8e4afdd94a01f0497c';
+
 const conversationHistory = {};
+const userMessageCount = {}; // 記錄每個用戶的連續對話次數
 
 async function fetchSubsidies() {
   const records = [];
@@ -43,7 +47,60 @@ function buildSubsidyContext(subsidies) {
   }).join('\n\n---\n\n');
 }
 
-// 從 LINE 取得用戶顯示名稱
+// 偵測是否需要人工介入
+function needsHumanIntervention(userMessage, aiReply, userId) {
+  const msg = userMessage.toLowerCase();
+
+  // 條件1：用戶有情緒
+  const emotionKeywords = ['生氣', '不滿', '抱怨', '爛', '沒用', '失望', '氣死', '白痴', '無言', '怎麼搞的', '投訴'];
+  if (emotionKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: '用戶情緒不佳' };
+  }
+
+  // 條件2：成交關鍵時刻
+  const actionKeywords = ['我想提案', '我要申請', '如何提案', '怎麼提案', '幫我申請', '我要開始', '我要合作', '聯絡你們'];
+  if (actionKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: '用戶想申請／提案' };
+  }
+
+  // 條件3：涉及個人資料
+  const personalKeywords = ['我的資料', '上傳文件', '填表', '需要什麼文件', '怎麼填'];
+  if (personalKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: '用戶需要文件協助' };
+  }
+
+  // 條件4：AI 回答不了
+  const confusedKeywords = ['你沒有回答', '你沒幫到', '這不是我要的', '答非所問', '不對', '你不懂'];
+  if (confusedKeywords.some(k => msg.includes(k))) {
+    return { needed: true, reason: 'AI 回答不符需求' };
+  }
+
+  // 條件5：對話超過 5 次還沒解決
+  const count = userMessageCount[userId] || 0;
+  if (count >= 5) {
+    return { needed: true, reason: `對話已達 ${count} 次仍未解決` };
+  }
+
+  return { needed: false };
+}
+
+// 推播通知給管理員
+async function notifyAdmin(userName, userMessage, reason, userId) {
+  const message = `🚨 需要人工介入！\n\n用戶：${userName}\n原因：${reason}\n最後訊息：${userMessage}\n\n👉 請至 LINE OA 後台處理對話`;
+
+  await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({
+      to: ADMIN_LINE_ID,
+      messages: [{ type: 'text', text: message }],
+    }),
+  });
+}
+
 async function getLineUserName(userId) {
   try {
     const res = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
@@ -56,7 +113,6 @@ async function getLineUserName(userId) {
   }
 }
 
-// 查 Airtable 是否已有此用戶的記錄
 async function findUserRecord(userName) {
   const encoded = encodeURIComponent(`{用戶名稱}="${userName}"`);
   const res = await fetch(
@@ -70,7 +126,6 @@ async function findUserRecord(userName) {
 
 async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
   try {
-    // 取得關鍵字
     const kwRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -90,19 +145,13 @@ async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
     const kwData = await kwRes.json();
     const keywords = kwData.content?.[0]?.text || '';
 
-    // 取得用戶名稱
     const userName = await getLineUserName(userId);
-
-    // 組對話紀錄這一筆
     const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
     const newEntry = `[${now}]\n用戶：${userMessage}\n玥：${aiReply}\n`;
-
-    // 查有沒有舊記錄
     const existing = await findUserRecord(userName);
     const nowISO = new Date().toISOString();
 
     if (existing) {
-      // 有舊記錄 → 追加對話
       const oldLog = existing.fields['對話紀錄'] || '';
       const oldKeywords = existing.fields['關鍵字'] || '';
       const oldCount = existing.fields['對話次數'] || 0;
@@ -126,7 +175,6 @@ async function logToAirtable(userId, userMessage, aiReply, source = 'LINE') {
         }),
       });
     } else {
-      // 沒有舊記錄 → 建新記錄
       await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_LOG_TABLE}`, {
         method: 'POST',
         headers: {
@@ -175,6 +223,7 @@ ${subsidyContext}
 4. 說明具體的申請步驟和聯絡方式
 5. 語氣親切、專業，使用繁體中文
 6. 如果資料庫沒有符合的補助，誠實說明並建議查詢政府官網
+7. 如果用戶想提案或申請，回覆：「感謝您的興趣！我已通知專人為您服務，請稍候片刻 😊」
 
 【回覆格式】
 - LINE 不支援 Markdown，不要用 ** 粗體 ** 或 # 標題
@@ -247,10 +296,23 @@ export default async function handler(req, res) {
     const userMessage = event.message.text;
     const replyToken = event.replyToken;
 
+    // 累計對話次數
+    userMessageCount[userId] = (userMessageCount[userId] || 0) + 1;
+
     try {
       const subsidies = await fetchSubsidies();
       const subsidyContext = buildSubsidyContext(subsidies);
       const reply = await callClaude(userId, userMessage, subsidyContext);
+
+      // 偵測是否需要人工介入
+      const { needed, reason } = needsHumanIntervention(userMessage, reply, userId);
+      if (needed) {
+        const userName = await getLineUserName(userId);
+        await notifyAdmin(userName, userMessage, reason, userId);
+        // 介入後重置計數
+        userMessageCount[userId] = 0;
+      }
+
       await Promise.all([
         replyToLine(replyToken, reply),
         logToAirtable(userId, userMessage, reply, 'LINE'),
