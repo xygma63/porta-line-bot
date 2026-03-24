@@ -8,7 +8,10 @@ const AIRTABLE_BASE = process.env.AIRTABLE_BASE;
 const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE;
 const AIRTABLE_LOG_TABLE = 'tblVCrX3ZYpOs5Ixa';
 
-const ADMIN_LINE_ID = 'Ub92d4bee9d4afd8e4afdd94a01f0497c';
+const ADMIN_IDS = [
+  'Ub92d4bee9d4afd8e4afdd94a01f0497c', // 希小玥
+  // 'U新員工的LINE_ID', // 新員工
+];
 
 const conversationHistory = {};
 const userMessageCount = {};
@@ -46,7 +49,7 @@ function buildSubsidyContext(subsidies) {
   }).join('\n\n---\n\n');
 }
 
-function needsHumanIntervention(userMessage, aiReply, userId) {
+function needsHumanIntervention(userMessage, userId) {
   const msg = userMessage.toLowerCase();
 
   const emotionKeywords = ['生氣', '不滿', '抱怨', '爛', '沒用', '失望', '氣死', '白痴', '無言', '怎麼搞的', '投訴'];
@@ -77,20 +80,22 @@ function needsHumanIntervention(userMessage, aiReply, userId) {
   return { needed: false };
 }
 
-async function notifyAdmin(userName, userMessage, reason, userId) {
-  const message = `🚨 需要人工介入！\n\n用戶：${userName}\n原因：${reason}\n最後訊息：${userMessage}\n\n👉 請至 LINE OA 後台處理對話`;
+async function notifyAdmins(userName, userMessage, reason, userId) {
+  const message = `🚨 需要人工介入！\n\n用戶：${userName}\n原因：${reason}\n最後訊息：${userMessage}\n\n👉 點此直接回覆用戶：\nhttps://manager.line.biz/account/@459sqlrr/chat/${userId}`;
 
-  await fetch('https://api.line.me/v2/bot/message/push', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
-    },
-    body: JSON.stringify({
-      to: ADMIN_LINE_ID,
-      messages: [{ type: 'text', text: message }],
-    }),
-  });
+  await Promise.all(ADMIN_IDS.map(adminId =>
+    fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+      },
+      body: JSON.stringify({
+        to: adminId,
+        messages: [{ type: 'text', text: message }],
+      }),
+    })
+  ));
 }
 
 async function getLineUserName(userId) {
@@ -290,6 +295,8 @@ export default async function handler(req, res) {
     const userMessage = event.message.text;
     const replyToken = event.replyToken;
 
+    if (ADMIN_IDS.includes(userId)) continue;
+
     userMessageCount[userId] = (userMessageCount[userId] || 0) + 1;
 
     try {
@@ -297,10 +304,10 @@ export default async function handler(req, res) {
       const subsidyContext = buildSubsidyContext(subsidies);
       const reply = await callClaude(userId, userMessage, subsidyContext);
 
-      const { needed, reason } = needsHumanIntervention(userMessage, reply, userId);
+      const { needed, reason } = needsHumanIntervention(userMessage, userId);
       if (needed) {
         const userName = await getLineUserName(userId);
-        await notifyAdmin(userName, userMessage, reason, userId);
+        await notifyAdmins(userName, userMessage, reason, userId);
         userMessageCount[userId] = 0;
       }
 
